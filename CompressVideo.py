@@ -13,7 +13,7 @@ import shutil
 import hashlib
 import json
 import platform
-from tkinter import Tk, StringVar, DISABLED, TclError
+from tkinter import Tk, StringVar, DISABLED, TclError, PhotoImage
 from tkinter.ttk import *
 from tkinter import filedialog
 
@@ -143,19 +143,25 @@ def process_daemon(path: str, parent_window) -> None:
 
         if len(filenames) == 0:
             return
-        print(f"process_daemon: found {len(filenames)} matching files")
+        print(f"process_daemon: found {len(filenames)} matching files:")
+        for filename in filenames:
+            print(f"\t{os.path.basename(filename)}")
 
         parent_window.progress_total["maximum"] = len(filenames)
         parent_window.progress_total["value"] = 1
-        for f_id in range(len(filenames)):
+        N = len(filenames)
+        success = 0
+        for f_id in range(N):
             filename = filenames[f_id]
-            print("process_daemon: convert file %d: %s" % (f_id, filename))
+            print(f"process_daemon: convert file {f_id+1}: {filename}")
             parent_window.label_video_name["text"] = os.path.basename(filename)
 
-            compress_file(filename, parent_window)
+            success += hash_and_compress(filename, parent_window)
 
             parent_window.progress_total["value"] = f_id + 1
             # Attention: cannot set parent_window attributes while main thread is waiting for worker thread to join
+
+            parent_window.label_progress["text"] = f"{success} videos compressed, {f_id-success+1} failed"
 
             if parent_window.stop:
                 return
@@ -173,17 +179,21 @@ def process_daemon(path: str, parent_window) -> None:
         parent_window.ffmpeg_thread = None
 
 
-def compress_file(in_filename: str, parent_window) -> bool:
+def hash_and_compress(in_filename: str, parent_window) -> bool:
     # check if in file is in hash list
 
     settings = Settings()
-    file_hash: str = get_file_fingerprint(in_filename)
-    if file_hash in settings.hash_list:
-        print('compress_file: file %s is already in hash list, skip' % in_filename)
-        return True
+    try:
+        file_hash: str = get_file_fingerprint(in_filename)
+        if file_hash in settings.hash_list:
+            print('compress_file: file %s is already in hash list, skip' % in_filename)
+            return True
+    except FileNotFoundError:
+        print(f"Could not find file '{in_filename}'")
+        return False
 
-    # start compression of in_file
-    result: bool = ffmpeg(in_filename, parent_window)
+    # start compression
+    result: bool = compress_and_replace(in_filename, parent_window)
 
     if result:
         # in_filename is now compressed (or was already)
@@ -200,21 +210,78 @@ def compress_file(in_filename: str, parent_window) -> bool:
     return result
 
 
-def ffmpeg(in_filename: str, parent_window) -> bool:
+def compress_and_replace(in_filename: str, parent_window) -> bool:
     """
     execute ffmpeg conversion and check progress
+    :return: True if file is, or was, compressed; False if compression failed
     :param parent_window: parent window object
     :param in_filename: original video to be converted
     """
-
-    print(f"ffmpeg: compress video file '{in_filename}'")
+    print(f"ffmpeg({in_filename})")
     settings = Settings()
+
     ext: str = os.path.splitext(in_filename)[1].casefold()
     assert ext in settings.extensions
+
+    # print(f"ffmpeg: ffprobe file")
+    cmd: list = ["ffprobe", "-hide_banner", in_filename]
+    try:
+        process = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise FileNotFoundError("ffprobe is not available in $PATH")
+
+    codec = None
+    w = None
+    h = None
+    crf = None
+
+    for line in process.stderr.split("\n"):
+        matches = re.findall(r"Stream #(\d+:\d+).*Video:.*, (\d+)x(\d+).*, (\d+(\.\d+)?) fps", line)
+        if matches:
+            matches = matches[0]  # list of tuples, as more than one group is in pattern, get tuple #0 from list
+            stream = matches[0]
+            w = int(matches[1])
+            h = int(matches[2])
+            fps = float(matches[3])
+
+            # default codec and quality
+            codec = "libx264"
+            crf = "23"
+
+            # use h265 for footage larger than WQHD
+            if w*h > 2560*1440:
+                codec = "libx265"
+                # use CRF 23 for high framerate footage (>30 fps), default to CRF 25
+                if fps > 30:
+                    crf = "23"
+                else:
+                    crf = "25"
+                break
+
+            # use CRF 20 for footage larger than FHD or with high frame rate
+            if w*h > 1920*1080 or fps > 30:
+                codec = "libx264"
+                crf = "20"
+                break
+
+    if not codec:
+        print(process.stderr)
+        print("Could not find video stream resolution metadata")
+        return False
+
+    print(f"ffmpeg: convert '{os.path.basename(in_filename)}' ({w}x{h}) using codec {codec} with CRF {crf}")
     tmp_filename: str = tempfile.gettempdir() + os.path.sep + get_filename(in_filename) + "_convert" + ext
-    cmd: list = ["ffmpeg", "-y", "-i", in_filename, "-map", "0", "-map_metadata", "0", "-c", "copy",
-                 "-c:a", "libvorbis", "-aq", "4", "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                 "-movflags", "+faststart", tmp_filename]
+    cmd: list = ["ffmpeg",
+                 "-hide_banner", "-y",
+                 "-i", in_filename,
+                 "-map", "0",
+                 "-map_metadata", "0",
+                 "-c", "copy",
+                 "-c:a", "libvorbis", "-aq", "4",
+                 "-c:v", codec, "-crf", crf, "-preset", "slow",
+                 "-max_muxing_queue_size", "4096",
+                 "-movflags", "+faststart",
+                 tmp_filename]
     try:
         process = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE,
                                    universal_newlines=True, cwd=None)
@@ -225,6 +292,7 @@ def ffmpeg(in_filename: str, parent_window) -> bool:
 
     parent_window.progress_video["maximum"] = 100
     parent_window.progress_video["value"] = 0
+    lines = []
 
     while True:
         line: str = process.stderr.readline().rstrip()
@@ -235,6 +303,7 @@ def ffmpeg(in_filename: str, parent_window) -> bool:
             process.terminate()
 
         if line:
+            lines.append(line)
             # print(line)
             if not total_time:
                 matches: list = re.findall(r"Duration: (\d\d:\d\d:\d\d)", line)
@@ -252,7 +321,9 @@ def ffmpeg(in_filename: str, parent_window) -> bool:
 
     exitcode = process.poll()
     if exitcode != 0:
-        print(f"ffmpeg: error code {exitcode}")
+        print(f"\tffmpeg error code {exitcode}")
+        for line in lines:
+            print(f"\t"+line)
         try:
             os.remove(tmp_filename)
         except FileNotFoundError:
@@ -262,28 +333,28 @@ def ffmpeg(in_filename: str, parent_window) -> bool:
         old_file_size: int = os.path.getsize(in_filename)
         new_file_size: int = os.path.getsize(tmp_filename)
         if new_file_size > 1024:
-            print(old_file_size)
-            print(new_file_size)
-            print(f"ffmpeg: reduced file size by {100-100*new_file_size//old_file_size}%")
-            if new_file_size < old_file_size * 0.8:
+            #  print(old_file_size)
+            #  print(new_file_size)
+            print(f"\treduced file size by {100-100*new_file_size//old_file_size}%")
+            if new_file_size < old_file_size * 0.9:
                 # compressed video file is sufficiently smaller compared to original
                 a_time = os.path.getatime(in_filename)
                 m_time = os.path.getmtime(in_filename)
                 os.utime(tmp_filename, (a_time, m_time))  # copy file modified date
-                print("ffmpeg: replace video with new file")
+                print("\treplace video with new file")
                 # os.replace() # does not work when moving files between file systems
                 os.remove(in_filename)  # shutil.move does not guarantee overwriting existing file
                 shutil.move(tmp_filename, in_filename)  # move tmp file to original file location
                 # os.remove(tmp_filename)
             else:
                 # compressing does not make video file smaller
-                print("ffmpeg: keep original video")
+                print("\tkeep original video")
                 os.remove(tmp_filename)
             # after conversion in_filename is compressed, or was already compressed so tmp is discarded
             return True
 
         else:
-            print("ffmpeg: output file is very small, video conversion problem?")
+            print("\toutput file is very small, video conversion problem?")
             os.remove(tmp_filename)
             return False
 
@@ -301,21 +372,24 @@ class MainWindow:
 
         self.parent.title("Video Compression")
         self.parent.resizable(False, False)
+        self.parent.iconphoto(False, PhotoImage(file="img/round_movie_black_48dp.png"))
 
         self.path_str = StringVar(value=settings.last_folder)
         self.path_str.trace_add("write", self.path_changed)
         self.path = Entry(self.parent, textvariable=self.path_str, width=50)
-        self.path.grid(row=0, column=0, padx=5)
+        self.path.grid(row=0, column=0, sticky='we', padx=5)
         self.btn_browse = Button(self.parent, text='Browse', command=self.browse)
         self.btn_browse.grid(row=0, column=1, padx=5)
         self.progress_video = Progressbar(self.parent, value=0, maximum=100, mode="determinate")
         self.progress_video.grid(row=1, column=0, columnspan=2, sticky='we', padx=5)
         self.progress_total = Progressbar(self.parent, value=0, maximum=100, mode="determinate")
         self.progress_total.grid(row=2, column=0, columnspan=2, sticky='we', padx=5)
-        self.label_video_name = Label(self.parent, text='')
+        self.label_video_name = Label(self.parent, text='', anchor='w')
         self.label_video_name.grid(row=3, column=0)
+        self.label_progress = Label(self.parent, text='', anchor='w')
+        self.label_progress.grid(row=4, column=0)
         self.btn_start_stop = Button(self.parent, text='Start', state=DISABLED, command=self.start_stop)
-        self.btn_start_stop.grid(row=3, column=1)
+        self.btn_start_stop.grid(row=3, rowspan=2, column=1)
 
         n_col, n_row = self.parent.grid_size()
         for col in range(n_col):
